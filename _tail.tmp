@@ -1,0 +1,80 @@
+}
+
+/* ------------------------------------------------------- 后台预转队列 */
+
+const WARMQ = [];        // 待转队列
+let WARM_BUSY = 0;       // 正在转的个数（固定 1：转码吃满核，别和播放抢）
+let WARM_DONE = 0, WARM_FAIL = 0;
+
+/** 把一个文件塞进后台转码队列（同一个 key 不会重复入队） */
+function kick(abs, rel, prof) {
+  try {
+    const p0 = prof || profile('');
+    if (!p0.on || !DIR) return false;
+    const key = keyOf(abs, rel, p0);
+    if (hitOf(key)) return false;
+    if (PENDING.has(key)) return false;
+    if (WARMQ.some(x => x.key === key)) return false;
+    WARMQ.push({ abs, rel, prof: p0, key });
+    pump();
+    return true;
+  } catch { return false; }
+}
+
+function pump() {
+  if (WARM_BUSY >= 1 || !WARMQ.length) return;
+  const j = WARMQ.shift();
+  WARM_BUSY++;
+  console.log('[aac] 后台预转开始 ' + j.rel + '（队列剩 ' + WARMQ.length + '）');
+  Promise.resolve()
+    .then(() => prewarm(j.abs, j.rel, j.prof))
+    .then(r => {
+      if (r && r.ok) { WARM_DONE++; enforceLimit().catch(() => {}); }
+      else { WARM_FAIL++; console.log('[aac] 预转未完成 ' + j.rel + '：' + ((r && r.err) || (r && r.skipped) || '')); }
+    })
+    .catch(e => { WARM_FAIL++; console.log('[aac] 预转异常 ' + j.rel + '：' + String(e && e.message || e)); })
+    .then(() => { WARM_BUSY--; setTimeout(pump, 1200); });
+}
+
+function warmInfo() {
+  return { queued: WARMQ.length, busy: WARM_BUSY, done: WARM_DONE, fail: WARM_FAIL };
+}
+
+/** 后台预热：不占请求，转完落缓存（给"整本/整专辑先转好"用） */
+async function prewarm(abs, rel, prof, cb) {
+  const p = prof || profile('');
+  const j = await judge(abs, rel, p);
+  if (!j.need) return { ok: true, skipped: j.why };
+  const key = keyOf(abs, rel, p);
+  const hit = hitOf(key);
+  if (hit) return { ok: true, hit: true };
+  const pth = cachePaths(key);
+  const partPath = pth.part + '.' + process.pid + '.' + (++PART_SEQ);
+  const ctx = await startTranscode(abs, p);
+  if (!ctx.child) return { ok: false, err: ctx.err || '' };
+  let ws;
+  try { ws = fs.createWriteStream(partPath); } catch { return { ok: false, err: 'write' }; }
+  let n = 0;
+  ctx.child.stdout.on('data', c => { n += c.length; try { ws.write(c); } catch { /* ignore */ } });
+  const ok = await ctx.done;
+  try { ws.end(); } catch { /* ignore */ }
+  if (ok && n > 0) {
+    if (p.codec === 'mp3') {
+      try { fs.renameSync(partPath, pth.mp3); } catch { /* ignore */ }
+    } else {
+      try { fs.renameSync(partPath, pth.aac); } catch { /* ignore */ }
+      await remux(key);
+    }
+    if (cb) { try { cb(rel); } catch { /* ignore */ } }
+    return { ok: true, bytes: n };
+  }
+  try { fs.unlinkSync(partPath); } catch { /* ignore */ }
+  return { ok: false, err: 'transcode-failed' };
+}
+
+module.exports = {
+  init, info, stats, purge, kick, warmInfo, globalOn, setGlobal,
+  profile, setDev, devList,
+  judge, probe, serve, prewarm,
+  DEF, LOSSLESS, keyOf,
+};

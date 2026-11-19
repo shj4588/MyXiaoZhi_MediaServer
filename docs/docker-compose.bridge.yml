@@ -1,0 +1,47 @@
+# MyXiaoZhi_MediaServer —— 默认 docker bridge 版（与落雪同一 bridge）
+#
+# 背景：部分 NAS（如威联通）上落雪与 mediaserver 不在同一网络时连不上。
+# 默认 bridge 版让 mediaserver 与落雪容器在**同一个 bridge** 内走容器内网 IP 互访。
+# 原 Podroid 版用自定义网络 r1net + 服务名 lxserver:9527；群晖改默认 bridge 后：
+#   ✗ 服务名 lxserver 不解析（默认 bridge 无内建 DNS）
+#   ✗ 宿主机外部 IP 192.168.2.189 容器内不通（群晖网络策略）
+#   ✓ 落雪容器内网 IP 172.17.0.x:9527（同一 bridge 内直连）
+#
+# ★★ 部署前必做：查落雪容器内网 IP，替换下面 LX_ADDR 里的 172.17.0.2：
+#     docker ps --format '{{.Names}} {{.Networks}}' | grep -i lx
+#     docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' <落雪容器名>
+#   若落雪不在默认 bridge（Networks 列不是 bridge），要先把它接进 bridge 或改用
+#   同一个自定义网络 + 服务名，见回复说明。
+#
+# 部署：把本文件复制成部署目录里的 docker-compose.yml，覆盖后执行
+#   docker compose down          # 停旧容器（保留 files/ 数据卷）
+#   docker compose up -d         # ★ 不要 --build，用已固化的 r1-media:local 镜像
+services:
+  r1-media:
+    image: r1-media:local
+    container_name: MyXiaoZhi_MediaServer
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    volumes:
+      # 账本 / 在线池 / 标签缓存 / 电台清单 / 播放记录 / my_lx，必须持久化
+      - ./files:/app/files
+      - ./music:/music
+      - ./audiobook:/audiobook
+    environment:
+      - TZ=Asia/Shanghai
+      - MUSIC_DIR=/music
+      - ABL_DIR=/audiobook
+      - RADIOS_FILE=/app/files/radios.json
+      # ★ 关键：落雪地址用**落雪容器内网 IP**（同一 bridge 内直连）。
+      #   把 172.17.0.2 换成 docker inspect 查到的真实落雪 IP；
+      #   默认 bridge 无服务名 DNS，也别写 NAS 的 LAN IP（容器内可能不通）。
+      - LX_ADDR=http://172.17.0.2:9527
+      # ---------------- AlphaPi（小智）兼容层 ----------------
+      - AP_TRANSCODE=auto
+      - AP_RATE=24000
+      - AP_BITS=8
+      - AP_CH=1
+    # 宿主机 files/ 多为 root 属主，显式 root 跑最省心
+    user: "0:0"
+    # ★ 不走任何 networks: 段 = 使用 docker 默认 bridge

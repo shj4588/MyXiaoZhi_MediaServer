@@ -1,0 +1,15 @@
+{
+  "name": "myxiazhi-media-server",
+  "version": "1.7.55",
+  "description": "MyXiaoZhi_MediaServer —— R1 音箱 + AlphaPi（小智）自建媒体服务器：本地音乐 / 在线音乐 / 网络电台 / 本地有声书，按设备 MAC 记进度与续播，多设备分组共享进度，可按设备降档转码（AGPL-3.0）",
+  "license": "AGPL-3.0-only",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js --port 8100",
+    "test": "node _tests/ab-cache.js && node _tests/song-cache.js && node _tests/ap-play-args.js && node _tests/ap-history.js && node _tests/src-label.js && node _tests/abl-coll-name.js && node _tests/aac-whitelist.js",
+    "selftest": "node -e \"const t=require('./transcode');t.check().then(s=>{console.log(s);return t.selftest(1.5)}).then(r=>console.log(r))\""
+  },
+  "dependencies": {
+    "music-metadata": "^12.2.1"
+  }
+}
