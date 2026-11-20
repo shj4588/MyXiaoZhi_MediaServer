@@ -1566,7 +1566,7 @@ async function apBookItems(q, ep, n, resume, ss) {
   //   听感就是"刚听完又从头念"。回落只在"续播用的 lastEp 已经过期"时才允许。
   const strict = want > 1 || !!(resume && resume.nextEp);
 
-  /** 取一本书从 from 起的集（非 strict 时越界回第 1 集，别把 404 甩给用户） */
+  /** 取一本书从 from 起的集（**不再自己回退第 1 集**） */
   const epsFrom = async (id, from) => {
     const pull = async f => {
       const d = await apSelfJson('/api/abl/eps?id=' + encodeURIComponent(id)
@@ -1574,9 +1574,28 @@ async function apBookItems(q, ep, n, resume, ss) {
       if (!d || !Array.isArray(d.episodes)) return { d: null, eps: [] };
       return { d, eps: d.episodes.filter(e => (e.ep || 0) >= f) };
     };
-    let r = await pull(from);
-    if (!r.eps.length && from > 1 && !strict) r = await pull(1);   // 越界/该集被删 ⇒ 回第 1 集
-    return r;
+    /* ★ v1.7.56：这里原来有「非 strict 越界 ⇒ pull(1) 回第 1 集」。
+       它和本地残卷撞在一起就是灾难：stem 续播第 14 集，本地只有 3 集 ⇒ 直接播第 1 集，
+       而且这一播还会把 `g:default|凡人修仙传` 的续播记录覆盖成 ep1/pos0，
+       下次再续播永远从第 1 集开始（2026-11-20 19:5x 实测就是这个链路）。
+       现在本地取不到就如实返回空，由调用方继续走 ② 在线；
+       "实在都没有"的兜底放到在线分支之后（且退最近集，不回第 1 集）。 */
+    return pull(from);
+  };
+
+  /** 兜底：本地这本书里「≤target 的最近一集」（都没有才给第 1 集）。
+   *  只在"本地没有目标集、在线也捞不到"时用 —— 宁可播最近一集，也别回第 1 集重头来。 */
+  const localFallback = async (id, target) => {
+    const st = Math.max(1, (parseInt(target, 10) || 1) - 60);
+    const d = await apSelfJson('/api/abl/eps?id=' + encodeURIComponent(id)
+      + '&ep=' + st + '&size=80');
+    if (!d || !Array.isArray(d.episodes) || !d.episodes.length) return null;
+    const cands = d.episodes.filter(e => (e.ep || 0) <= (target || 1));
+    const e = cands.length ? cands[cands.length - 1] : d.episodes[0];
+    const abs = ablocal.absOf(e.file);
+    if (!abs || !fs.existsSync(abs)) return null;
+    return { item: { input: abs, kind: 'file', title: e.title, ep: e.ep, url: e.url || '' },
+      total: d.total };
   };
 
   // ① 本地有声书库
@@ -1611,8 +1630,10 @@ async function apBookItems(q, ep, n, resume, ss) {
          本地取不到 ⇒ 记下原因，继续走 ② 在线分支回源；
          在线也取不到 ⇒ 才报收尾（tail 保留）。
        （R1 侧 device 1.3.359 的 ab_resume 已有同口径降级链） */
-    const localShort = (!eps.length && strict)
-      ? { name: sub.name || pick.name || key, total: (d && d.total) || 0, from }
+    /* ★ v1.7.56：**不再区分 strict**。只要本地拿不到 from 这一集就回源在线 ——
+       续播（want=0、nextEp=false）同样适用，这正是 stem 续第 14 集被踢回第 1 集的场景。 */
+    const localShort = (!eps.length)
+      ? { name: sub.name || pick.name || key, total: (d && d.total) || 0, from, localId: useId }
       : null;
     if (localShort) {
       console.log('[ap] 本地库「' + localShort.name + '」只有 ' + (localShort.total || '?')
@@ -1654,8 +1675,15 @@ async function apBookItems(q, ep, n, resume, ss) {
   // ② 在线书库
   const bs = await apSelfJson('/api/ab/search?q=' + encodeURIComponent(key));
   if (!bs || !Array.isArray(bs.books) || !bs.books.length) {
-    // ★ v1.7.56：本地残卷回源到这儿还搜不到 = 这才真是"没得听"
+    /* ★ v1.7.56：本地残卷回源到这儿还搜不到 ⇒ 退本地「≤target 最近一集」。
+       这一格以前是"非 strict 直接回第 1 集"，听起来就是整本重头开始。 */
     if (localShort) {
+      const fb = await localFallback(localShort.localId, localShort.from);
+      if (fb) {
+        console.log('[ap] 在线搜不到「' + localShort.name + '」，退本地第 ' + fb.item.ep + ' 集');
+        return { items: [fb.item], book: localShort.name, bookTitle: localShort.name,
+          id: localShort.localId, from: fb.item.ep, total: fb.total, local: true, off: 0, dur: 0 };
+      }
       return { err: '本地库「' + localShort.name + '」只有 ' + (localShort.total || '?')
         + ' 集，第 ' + localShort.from + ' 集在线也没找到', tail: true };
     }
@@ -1670,7 +1698,20 @@ async function apBookItems(q, ep, n, resume, ss) {
   if (!d || !Array.isArray(d.episodes) || !d.episodes.length) {
     return { err: '这本书的集表拉不到：' + b.book };
   }
-  const eps = d.episodes.filter(e => (e.ep || 0) >= from).slice(0, cnt);
+  let eps = d.episodes.filter(e => (e.ep || 0) >= from).slice(0, cnt);
+  if (!eps.length && !strict) {
+    /* ★ v1.7.56：续播记录指向的那集在线也没了（下架 / 换版本）⇒ 退到 ≤from 的**最近一集**。
+       绝对不能回第 1 集：那等于"整本从头重放"，比直接报错还伤。 */
+    const back = await apSelfJson('/api/ab/episodes?q=' + encodeURIComponent(b.book)
+      + '&albumId=' + encodeURIComponent(b.albumId || '')
+      + '&source=' + encodeURIComponent(b.source || 'kw')
+      + '&ep=' + Math.max(1, from - 60) + '&size=80');
+    const cand = ((back && back.episodes) || []).filter(e => (e.ep || 0) <= from && e.rid);
+    if (cand.length) {
+      eps = [cand[cand.length - 1]];
+      console.log('[ap] 「' + b.book + '」第 ' + from + ' 集在线已无，退第 ' + eps[0].ep + ' 集');
+    }
+  }
   if (!eps.length) {
     return { err: '已经没有第 ' + from + ' 集了（' + b.book + ' 共 ' + (d.total || '?') + ' 集）', tail: true };
   }
