@@ -242,7 +242,7 @@ const PORT = pIdx > -1 ? parseInt(argv[pIdx + 1], 10) : 8099;
 //   续播点全糊成一本，看不出在听哪一部。relIndex/bookOfRel 与 /v1/pos 的本地书
 //   名单（isAblBook）本来就按子书名记，这次只是把集表响应补齐到同一口径，
 //   device 侧拿到的 book 名随之变成子书名，两侧不再各说各话。
-const MS_VER = '1.7.55';
+const MS_VER = '1.7.56';
 
 // 1.7.39（2026-11-18）：**修「播放记录在几集之间来回跳」**
 //   现象：R1 在听「遮天 第4集」，播放记录却每 14 秒来回刷「第1集」和「第4集」两条，
@@ -1602,16 +1602,30 @@ async function apBookItems(q, ep, n, resume, ss) {
     const useId = sub.id || pick.id;
     const from = want || (resume && resume.ep) || sub.lastEp || 1;
     const { d, eps } = await epsFrom(useId, from);
-    if (!eps.length && strict) {
-      return { err: '已经没有第 ' + from + ' 集了（' + (sub.name || pick.name || key)
-        + ' 共 ' + ((d && d.total) || '?') + ' 集）', tail: true };
+    /* ★ v1.7.56：**本地库只是残卷时，别再当成"全书听完"**。
+       /audiobook 里同名的《凡人修仙传》实测只有 3 集（在线 2113 集），
+       而设备的续播指针会一直指着这本残卷。旧版集号一越界就在这儿
+       return tail=true，stem 只听到「已经没有第 7 集了（共 3 集）」，
+       看上去像书听完了 —— 实际是本地不全，第 7 集在线明明有。
+       用户口径是「本地库 → 缓存 → 在线」，所以这里改成：
+         本地取不到 ⇒ 记下原因，继续走 ② 在线分支回源；
+         在线也取不到 ⇒ 才报收尾（tail 保留）。
+       （R1 侧 device 1.3.359 的 ab_resume 已有同口径降级链） */
+    const localShort = (!eps.length && strict)
+      ? { name: sub.name || pick.name || key, total: (d && d.total) || 0, from }
+      : null;
+    if (localShort) {
+      console.log('[ap] 本地库「' + localShort.name + '」只有 ' + (localShort.total || '?')
+        + ' 集，缺第 ' + from + ' 集 → 回源在线');
     }
     if (eps.length) {
       const take = eps.slice(0, cnt);
       const items = [];
       for (const e of take) {
         const abs = ablocal.absOf(e.file);
-        if (abs && fs.existsSync(abs)) items.push({ input: abs, kind: 'file', title: e.title, ep: e.ep });
+        // ★ v1.7.56：带上设备可直接播放的 url（/api/abl/eps 已补成 NAS 绝对地址），
+        //   统一解析口 /api/ab/pick 要用它，别让调用方再去猜 /m/ 路径。
+        if (abs && fs.existsSync(abs)) items.push({ input: abs, kind: 'file', title: e.title, ep: e.ep, url: e.url || '' });
       }
       if (items.length) {
         // 显式 `ss` 优先（设备暂停后继续，位置是它自己算的、最准）；
@@ -1640,6 +1654,11 @@ async function apBookItems(q, ep, n, resume, ss) {
   // ② 在线书库
   const bs = await apSelfJson('/api/ab/search?q=' + encodeURIComponent(key));
   if (!bs || !Array.isArray(bs.books) || !bs.books.length) {
+    // ★ v1.7.56：本地残卷回源到这儿还搜不到 = 这才真是"没得听"
+    if (localShort) {
+      return { err: '本地库「' + localShort.name + '」只有 ' + (localShort.total || '?')
+        + ' 集，第 ' + localShort.from + ' 集在线也没找到', tail: true };
+    }
     return { err: '没找到这本书：' + key };
   }
   const b = bs.books[0];
@@ -1660,7 +1679,7 @@ async function apBookItems(q, ep, n, resume, ss) {
     if (!e.rid) continue;
     try {
       const r = await resolveUrl({ rid: e.rid, source: e.source || b.source, title: e.title, artist: b.narrator });
-      if (r && r.url) items.push({ input: r.url, kind: 'url', title: e.title, ep: e.ep });
+      if (r && r.url) items.push({ input: r.url, kind: 'url', title: e.title, ep: e.ep, url: r.url });
     } catch { /* 这一集取不到链就跳过 */ }
   }
   if (!items.length) {
@@ -5047,6 +5066,65 @@ const server = http.createServer(async (req, res) => {
       //   设备真的搜过并播过（putFull）。已缓存的书不受影响 —— 上面的
       //   abcache.search(q) 磁盘命中路径照旧（别名是 putFull 时记的）。
       return send(res, { books, cache: 'search' });
+    }
+    /* ★ v1.7.56：**统一播放解析口**（本地库 → 磁盘缓存 → 在线，一条链走到底）
+       所有设备都调这里，不许各自实现「本地找不到怎么办」。
+       背景：本地 /audiobook 里同名的书常常只是残卷（《凡人修仙传》本地 3 集、
+       在线 2113 集），设备按集号去本地库一查越界，就报「没有第 N 集」，
+       听感上像全书听完了 —— 实际是本地不全。
+       解析逻辑只存在于 apBookItems 一处：
+         · stem / 其它 AlphaPi 设备 → /ap/play?kind=book（内部同一条链）
+         · R1 小智 / 网页 / 以后新增的任何设备 → GET /api/ab/pick?q=&ep=
+       参数：q 书名(必填) ep 集号(0=续播) n 连播集数(1~5) ss 集内秒
+       返回：{ ok, url, ep, title, dur, local, total, book, narrator, offset, epCount, items[] }
+       失败：{ ok:false, tail, err } —— tail=true 才是真的听到头了 */
+    if (p === '/api/ab/pick') {
+      const q = (u.searchParams.get('q') || '').trim();
+      const ep = Math.max(parseInt(u.searchParams.get('ep') || '0', 10) || 0, 0);
+      const n = Math.min(Math.max(parseInt(u.searchParams.get('n') || '1', 10) || 1, 1), 5);
+      const ss = u.searchParams.get('ss') || 0;
+      if (!q) return send(res, { ok: false, err: '缺 q（书名）' }, 400);
+      const rm = ep ? null : histResume(req, q, 'book');
+      const resume = rm ? {
+        ep: rm.ep || 1,
+        off: Math.max(0, (rm.pos || 0) - 10),
+        nextEp: !!rm.nextEp,
+      } : null;
+      const r = await apBookItems(q, ep, n, resume, ss)
+        .catch(e => ({ err: String((e && e.message) || e) }));
+      if (r.err) return send(res, { ok: false, tail: !!r.tail, err: r.err, book: q });
+      const self = selfBase(req);
+      /* ★ v1.7.56 坑：apBookItems 内部是通过 127.0.0.1 自调 /api/abl/eps 取集表的，
+         那边 selfBase 只能算出 http://127.0.0.1:8100 ⇒ 本地集的 url 会带 loopback，
+         设备拿到一律播不了（还会让人以为是"文件坏了"）。这里统一换回本次请求的地址。 */
+      const abs = x => {
+        if (!x) return '';
+        let s = String(x).replace(/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/i, self);
+        if (!/^https?:\/\//i.test(s)) s = self + (s.charAt(0) === '/' ? s : '/' + s);
+        return s;
+      };
+      const items = (r.items || []).map(it => ({
+        ep: it.ep,
+        title: it.title || '',
+        url: abs(it.url || (it.kind === 'url' ? it.input : '')),
+        ss: Math.round(it.ss || 0),
+      })).filter(it => it.url);
+      if (!items.length) return send(res, { ok: false, err: '取不到音频地址：' + (r.book || q) });
+      return send(res, {
+        ok: true,
+        url: items[0].url,
+        ep: items[0].ep,
+        title: items[0].title,
+        dur: Math.round(r.dur || 0),
+        local: !!r.local,
+        total: r.total || 0,
+        book: r.bookTitle || r.book || q,
+        series: r.series || '',
+        narrator: r.narrator || '',
+        offset: Math.round(r.off || 0),
+        epCount: items.length,
+        items,
+      });
     }
     if (p === '/api/ab/episodes') {
       const q = (u.searchParams.get('q') || '').trim();
