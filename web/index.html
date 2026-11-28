@@ -346,6 +346,15 @@ input[type=range]{flex:1;accent-color:var(--ac)}
   .grpAdd{margin-top:9px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .grpAdd select{background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:8px;
     color:var(--tx);padding:5px 8px;font-size:12px;max-width:240px;outline:none}
+  /* ★ v1.7.58 全部设备列表：右侧 ✕ 删除设备（连同记录，二次确认） */
+  .devRow{display:flex;align-items:center;gap:10px;border:1px solid var(--line);
+    border-radius:10px;padding:8px 12px;margin-top:8px}
+  .devRow .tx{flex:1;min-width:0}
+  .devRow .tx .a{font-size:13px;color:var(--tx)}
+  .devRow .tx .b{font-size:11px;color:var(--tx3);margin-top:2px;word-break:break-all}
+  .devRow .devx{font-style:normal;flex:none;width:24px;height:24px;line-height:22px;text-align:center;
+    border-radius:50%;border:1px solid var(--line);color:var(--tx3);cursor:pointer;font-size:12px}
+  .devRow .devx:hover{color:var(--err);border-color:var(--err);background:rgba(248,113,113,.1)}
 </style>
 </head>
 <body>
@@ -611,6 +620,13 @@ input[type=range]{flex:1;accent-color:var(--ac)}
       <small style="font-weight:400;color:var(--tx3)">选一个组加入，才会和组内设备共享进度</small>
     </div>
     <div id="grpSolo"></div>
+    <!-- ★ v1.7.58：全部设备（含已在组里的）—— 唯一目的就是「删掉不再来的设备」。
+         设备靠 MAC 认，换过机器/退过役的旧记录会一直挂在 history.json 里，
+         这里删 = 连它的播放记录、独立组进度、转码档位一起清掉。 -->
+    <div class="ttl" style="margin-top:18px">全部设备
+      <small style="font-weight:400;color:var(--tx3)">右侧 ✕ 删除设备，连同它的播放记录一起删</small>
+    </div>
+    <div id="grpAll"></div>
   </div>
 
   <div class="foot">
@@ -2040,6 +2056,31 @@ function grpSelHtml(cands) {
       + esc(x.solo ? '独立' : (x.grpName || '组')) + '）</option>';
   }).join('') + '</select>';
 }
+/* 最后活跃时间（设备记录里的 seen 是毫秒时间戳）—— 判断「这台是不是已经不用了」全靠它 */
+function grpAgo(ts) {
+  ts = Number(ts) || 0; if (!ts) return '';
+  var d = Math.max(0, Date.now() - ts), m = Math.floor(d / 60000);
+  if (m < 1) return '刚刚活跃';
+  if (m < 60) return m + ' 分钟前活跃';
+  var h = Math.floor(m / 60); if (h < 24) return h + ' 小时前活跃';
+  var dd = Math.floor(h / 24); if (dd < 30) return dd + ' 天前活跃';
+  return new Date(ts).toLocaleDateString() + ' 活跃';
+}
+/* ★ v1.7.58：删除设备（连同记录）。二次确认里把「删什么、不删什么、会不会又出现」
+   一次说清 —— 不然用户删完发现设备还在播、列表里又冒出来，会当成删除失败。 */
+function devDel(x) {
+  var nm = x.name || x.id;
+  if (!confirm('删除设备「' + nm + '」（' + x.id + '）？\n\n'
+    + '会一起删掉：\n'
+    + '· 它的播放记录（听过什么、听到第几集）\n'
+    + '· 它独立组里的续播进度\n'
+    + '· 转码白名单里的档位（如果有）\n\n'
+    + '不会动：所在分组本身、组里其他设备共享的进度。\n'
+    + '注意：设备若还在播放，下一次上报会重新出现在列表里。')) return;
+  grpPost({ action: 'devdel', dev: x.id }).then(function (d) {
+    if (d && d.ok) msg('已删除设备「' + nm + '」' + (d.books ? '（含独立组进度 ' + d.books + ' 条）' : ''));
+  });
+}
 function renderGroups() {
   if (!GRPS) return;
   var groups = GRPS.groups || [], devs = GRPS.devices || [];
@@ -2105,6 +2146,24 @@ function renderGroups() {
       grpPost({ action: 'assign', dev: x.id, gid: s.value });
     };
     sbox.appendChild(el);
+  });
+
+  /* ★ v1.7.58 全部设备（含已在组里的）：这里只做一件事 —— 删设备。
+     上面两个区是「编排进度归属」，这一区是「清理不再来的设备」，故意分开。 */
+  var allBox = $('grpAll'); allBox.innerHTML = '';
+  if (!devs.length) {
+    allBox.innerHTML = '<div class="note" style="margin:0">还没有任何设备 —— 让它播一次音乐/有声书，'
+      + 'device 会把 MAC 报上来（见上面的说明）。</div>';
+    return;
+  }
+  devs.forEach(function (x) {
+    var el = document.createElement('div'); el.className = 'devRow';
+    el.innerHTML = '<div class="tx"><div class="a">' + esc(x.name) + '</div>'
+      + '<div class="b">' + esc(x.id) + ' · ' + esc(x.solo ? '独立组' : (x.grpName || '分组'))
+      + (x.seen ? ' · ' + grpAgo(x.seen) : '') + '</div></div>'
+      + '<i class="devx" title="删除这台设备（连同它的记录）">✕</i>';
+    el.querySelector('.devx').onclick = function () { devDel(x); };
+    allBox.appendChild(el);
   });
 }
 $('bGrpRe').onclick = function (e) { e.preventDefault(); loadGroups(); msg('设备分组已刷新'); };

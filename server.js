@@ -255,7 +255,17 @@ const PORT = pIdx > -1 ? parseInt(argv[pIdx + 1], 10) : 8099;
 //   销毁连接至少能让它看到错误、带着 Range 重连（下一轮请求正好走续传）。
 //   60s 空闲看门狗（IDLE_MS）也纳入同一套接力：上游长时间不吐字节同样先续再认输。
 //   测试：_tests/pipe-resume.js —— 假上游「发一半就断 + 支持 Range」，验续传后字节一个不差。
-const MS_VER = '1.7.57';
+// 1.7.58（2026-11-28）：**Web 删除设备（连同记录）**（用户需求）
+//   设备分组页底部新增「全部设备」列表（含已在组里的）。每行右侧 ✕ → 二次确认后删：
+//   · 从所有分组的 devs 摘掉（组本身保留，别的成员进度不受影响）
+//   · 删 history.json 的 devices[id]（名字 / IP / UA / 最后活跃 / 播放列表 —— 这台听过什么全在这）
+//   · 删它**独立组**的书级进度（books 键前缀 g:solo:<dev>|）；组内共享进度不动（那是全组的）
+//   · 转码白名单（audio_profiles.json）里若有这台一并移除，免得留一条永远匹配不上的幽灵档位
+//   为什么不能只删 devices：分组里会留一个看不见的成员（组显示 N 台却只有 N-1 个 chip），
+//   独立组的书级进度与 devices 是两套存储，不删就永远躺在 history.json 里当垃圾。
+//   接口：POST /api/devgroups {action:'devdel', dev}（和 create/rename/delete/assign 同端点）。
+//   ★ 这是「清记录」不是「踢下线」：设备还在播，下一次上报会重新建条目（前端 confirm 已写明）。
+const MS_VER = '1.7.58';
 
 // 1.7.39（2026-11-18）：**修「播放记录在几集之间来回跳」**
 //   现象：R1 在听「遮天 第4集」，播放记录却每 14 秒来回刷「第1集」和「第4集」两条，
@@ -2023,6 +2033,47 @@ function dgSnapshot() {
     };
   }).sort((a, b) => (b.seen || 0) - (a.seen || 0));
   return { groups, devices };
+}
+
+/**
+ * ★ v1.7.58：删除一台设备的**全部痕迹**（Web「全部设备」列表右侧 ✕ 调它）。
+ *
+ * <p>只删 history.devices[id] 会留下两处残迹：① 分组里还挂着这个名字，组显示 N 台却只有
+ * N-1 个成员；② 设备独立成组时的书级进度是 books 里的 `g:solo:<dev>|…` 键，与 devices
+ * 解耦，不删就永远留在 history.json 里当幽灵记录。所以一次做四件事：</p>
+ * <ol>
+ *   <li>从所有分组的 devs 摘掉（组本身保留，别的成员进度不受影响）</li>
+ *   <li>删 devices[id]（名字 / IP / UA / 最后活跃 / 播放列表 —— 「这台听过什么」全在这）</li>
+ *   <li>删它**独立组**的书级进度（g:solo:&lt;dev&gt;| 前缀）；组内共享进度不动（那是全组的）</li>
+ *   <li>转码白名单里若有这台一并移除（否则留一条永远匹配不上的幽灵档位）</li>
+ * </ol>
+ * <p>注意：这是「清记录」不是「踢下线」—— 设备还在播的话，下一次上报会重新建条目。</p>
+ *
+ * @param {string} id 设备 id（MAC12 / ip-x / unk，原样比较）
+ * @returns {{dev:string, outGroups:number, hadDev:boolean, books:number}}
+ */
+function devDelete(id) {
+  const dev = String(id || '').trim();
+  if (!dev) return { dev: '', outGroups: 0, hadDev: false, books: 0 };
+  const g = dgLoad();
+  if (!g.groups) g.groups = {};
+  let outGroups = 0;
+  for (const k of Object.keys(g.groups)) {
+    const before = (g.groups[k].devs || []).length;
+    g.groups[k].devs = (g.groups[k].devs || []).filter(x => x !== dev);
+    if (g.groups[k].devs.length !== before) outGroups++;
+  }
+  if (outGroups) dgFlush();
+  const h = histLoad();
+  let hadDev = false, books = 0;
+  if (h.devices && h.devices[dev]) { delete h.devices[dev]; hadDev = true; }
+  const soloPrefix = 'g:solo:' + dev + '|';
+  for (const k of Object.keys(h.books || {})) {
+    if (k.indexOf(soloPrefix) === 0) { delete h.books[k]; books++; }
+  }
+  if (hadDev || books) histFlush();
+  try { aac.delDev(dev); } catch { /* 转码模块没启用也不影响删除 */ }
+  return { dev, outGroups, hadDev, books };
 }
 
 /**
@@ -5544,6 +5595,18 @@ const server = http.createServer(async (req, res) => {
           console.log('[grp] 设备 ' + dev + ' → ' + (to ? ('组 ' + to) : '独立组'));
           return send(res, Object.assign({ ok: true }, dgSnapshot()));
         }
+        /* ★ v1.7.58：删除设备 —— 连同它的记录一起删（Web「全部设备」列表右侧 ✕）。
+           为什么需要专门的口、以及具体删哪四处，见 devDelete() 的注释。 */
+        if (act === 'devdel') {
+          if (!dev) return send(res, { ok: false, err: '缺 dev' }, 400);
+          const r = devDelete(dev);
+          console.log('[grp] 删除设备 ' + dev + '：移出 ' + r.outGroups + ' 个组，'
+            + (r.hadDev ? '播放记录已删' : '无播放记录')
+            + (r.books ? '，独立组进度 ' + r.books + ' 条' : '') + '（设备还在播会重新出现）');
+          return send(res, Object.assign({
+            ok: true, removed: dev, books: r.books, outGroups: r.outGroups,
+          }, dgSnapshot()));
+        }
         return send(res, { ok: false, err: '未知 action：' + act }, 400);
       }
       return send(res, Object.assign({ ok: true, ver: MS_VER }, dgSnapshot()));
@@ -5828,6 +5891,7 @@ module.exports = {
   histDevTouch,   // ★ v1.7.39：给「同书两路错标上报合并」的测试用
   // ★ v1.7.38 设备分组（测试出口）
   DG_FILE, DG_DEFAULT, dgLoad, dgFlush, dgInit, dgSnapshot, dgGrpName,
+  devDelete,                              // ★ v1.7.58：删设备 + 记录（Web ✕）
   devGroupId, reqGroupId, isPseudoDev, bookKeyOf,
   histBackfillStream,
   histBackfillStreamAuto,
