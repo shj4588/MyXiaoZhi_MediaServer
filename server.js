@@ -242,7 +242,20 @@ const PORT = pIdx > -1 ? parseInt(argv[pIdx + 1], 10) : 8099;
 //   续播点全糊成一本，看不出在听哪一部。relIndex/bookOfRel 与 /v1/pos 的本地书
 //   名单（isAblBook）本来就按子书名记，这次只是把集表响应补齐到同一口径，
 //   device 侧拿到的 book 名随之变成子书名，两侧不再各说各话。
-const MS_VER = '1.7.56';
+// 1.7.57（2026-11-28）：**断流自动续传**（修「歌播着播着停了、跳下一首」）
+//   现象：日志 `[mini-lx] 转发流中断（单请求，不影响服务）：terminated`，紧接着播放器
+//   就跳下一首。terminated 是 undici 在「上游 body 没发完就断连」时抛的错 —— 源站
+//   （酷我/网易 CDN、落雪中继）半路把连接掐了，我们只是转发方，本身不产数据。
+//   以前 src 一报错就 `res.end()`：对外是「响应正常结束」，播放器当成**这首歌播完了**
+//   ⇒ 自动下一首。那句「不影响服务」只对进程成立（确实不会拖死容器），对这次播放是硬伤。
+//   修法：转发器搬到 pipeaudio.js 并加**断点续传** —— 记下已写进 res 的字节数，断了就用
+//   `Range: bytes=<已发>-` 重新取，最多续 3 次；源站回 200（不认 Range）或起点对不上
+//   就不接（宁可不接，也不能把播过的几 MB 再灌一遍）；续满了照常收尾。
+//   实在续不上才 `res.destroy()`，**不是** res.end —— 假 EOF 会让播放器静默跳歌，
+//   销毁连接至少能让它看到错误、带着 Range 重连（下一轮请求正好走续传）。
+//   60s 空闲看门狗（IDLE_MS）也纳入同一套接力：上游长时间不吐字节同样先续再认输。
+//   测试：_tests/pipe-resume.js —— 假上游「发一半就断 + 支持 Range」，验续传后字节一个不差。
+const MS_VER = '1.7.57';
 
 // 1.7.39（2026-11-18）：**修「播放记录在几集之间来回跳」**
 //   现象：R1 在听「遮天 第4集」，播放记录却每 14 秒来回刷「第1集」和「第4集」两条，
@@ -1287,7 +1300,9 @@ function serveAudio(req, res, input, kind, ctHint) {
       + (o.raw ? 'pcm' : 'wav') + '/u' + o.bits + '/' + o.rate + ' ' + String(input).slice(0, 110));
     return tc.serve(req, res, Object.assign({ input, kind, tag: String(input).slice(0, 100) }, o));
   }
-  return kind === 'url' ? pipeAudio(res, req, input) : sendLocalFile(res, req, input, ctHint);
+  return kind === 'url'
+    ? pipeAudio(res, req, input, null, PIPE_OPTS)
+    : sendLocalFile(res, req, input, ctHint);
 }
 
 /**
@@ -3405,106 +3420,20 @@ function abQualify(items) {
   return false;
 }
 
-/** 等响应头的上限（TCP+握手+上游首包慢，给足 20s）。拿不到头才算失败。 */
-const CONNECT_MS = 20000;
-/** 传输期：连续这么久「一个字节都没动」才判定上游死了（不是整条流的死期）。 */
-const IDLE_MS = 60000;
+// ★ v1.7.57：转发器整个搬到 pipeaudio.js（带「断流自动断点续传」）。
+//   原来就在这儿的 pipeAudio 是 v1.2.3 修「容器偶发停止」的产物：分段超时（CONNECT_MS
+//   只管等头）+ 传输期空闲看门狗（IDLE_MS）+ src/res 双 error 监听。那些教训一条没丢，
+//   全在 pipeaudio.js 的文件头注释里；这里只留一句话方便将来翻案发现场。
+//   为什么搬走：断流续传要能单独跑测试（_tests/pipe-resume.js 造一个「发一半就断、
+//   支持 Range」的假上游，验续传后字节一个不差），不能跟 5800 行的 server.js 绑死。
+const { pipeAudio, CONNECT_MS, IDLE_MS } = require('./pipeaudio');
 
-/**
- * 把上游音频流转发给播放器（/s/<i> 默认走这条）。
- * 为什么要转发而不是 302：R1 的 DLNA 播放器（Platinum/Neptune）不一定跟随重定向，
- * 转发出去对它就是一个普通 http 音频源，最稳。代价是 NAS 中转一点局域网流量。
- * 支持 Range（拖进度）与 HEAD（播放器探活）。
- *
- * ★ v1.2.3（2026-11-07）：容器「偶发意外停止」的真凶就在这儿。
- *   现场日志：
- *     node:events:502   throw er; // Unhandled 'error' event
- *     DOMException [TimeoutError]: The operation was aborted due to timeout
- *     Emitted 'error' event on Readable instance at: emitErrorNT …
- *   旧写法 `signal: AbortSignal.timeout(20000)` 的定时器**不会因为响应头到了就停**，
- *   它盯着整条连接的寿命。R1 播放器一暂停 / 一拖进度，下游就不再读，pipe 背压把上游
- *   body 卡住没人消费 —— 20s 一到 signal abort，body 流报错，而
- *   `Readable.fromWeb(up.body)` 出来的流**没人挂 error 监听** ⇒ Node 的
- *   "Unhandled 'error' event" 直接把整个进程干掉（compose 是 restart: unless-stopped，
- *   于是表现为「偶发停止」、正在播的歌和 Web 一起断）。
- *   现在分两段：
- *     ① CONNECT_MS 只管「等到响应头」，拿到头立刻 clearTimeout；
- *     ② 传输期换**空闲看门狗**：连续 IDLE_MS 没有字节流动才断，且「是我们自己按的
- *        暂停（背压）」不算上游死，继续等；
- *     ③ src / res 都挂 error，res 一 close 就销毁上游流 —— 任何一条流报错都只影响
- *        这一个请求，不许冒到进程级。
- */
-async function pipeAudio(res, req, upstream, onCommit) {
-  const range = req.headers.range || '';
-  const headers = { 'User-Agent': 'Mozilla/5.0' };
-  if (range) headers.Range = range;
-  const ac = new AbortController();
-  let connectTimer = setTimeout(() => ac.abort(), CONNECT_MS);
-  const stopConnectTimer = () => { if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; } };
-  try {
-    const up = await fetch(upstream, {
-      method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-      headers, redirect: 'follow', signal: ac.signal,
-    });
-    stopConnectTimer();                                  // ★ 头到了，别再掐整条流
-    const h = {
-      'Content-Type': up.headers.get('content-type') || 'audio/mpeg',
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'no-cache',
-    };
-    const len = up.headers.get('content-length');
-    if (len) h['Content-Length'] = len;
-    const cr = up.headers.get('content-range');
-    if (cr) h['Content-Range'] = cr;
-    res.writeHead(up.status === 206 ? 206 : (up.ok ? 200 : up.status), h);
-    if (req.method === 'HEAD' || !up.body) { res.end(); try { if (up.body) await up.body.cancel(); } catch {} return; }
-
-    const src = Readable.fromWeb(up.body);
-    let idleTimer = null;
-    const stopIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
-    const bump = () => {
-      stopIdle();
-      idleTimer = setTimeout(() => {
-        // 下游不读（播放器暂停 / 拖进度）也会让 pipe 停住，但那不是上游的错 —— 继续等
-        if (src.isPaused()) { bump(); return; }
-        stopIdle();
-        console.log('[mini-lx] 上游 ' + IDLE_MS + 'ms 无数据，掐断：' + String(upstream).slice(0, 120));
-        try { src.destroy(new Error('upstream idle')); } catch { /* already dead */ }
-        // 已经声明了 Content-Length 却传不完 ⇒ 只能断连接，不能 res.end()（那会发一条
-        // 「短了半截」的完整响应，播放器当成正常 EOF，反而不重试）
-        try { res.destroy(); } catch { /* client gone */ }
-      }, IDLE_MS);
-    };
-    // ★ 这三行缺一行就会重演「一条流报错 ⇒ 整个容器重启」
-    src.on('error', e => {
-      stopIdle();
-      console.log('[mini-lx] 转发流中断（单请求，不影响服务）：' + String(e && e.message || e).slice(0, 120));
-      try { res.end(); } catch { /* client gone */ }
-    });
-    res.on('error', () => { stopIdle(); try { src.destroy(); } catch { /* ignore */ } });
-    res.on('close', () => { stopIdle(); try { src.destroy(); } catch { /* ignore */ } });
-    src.on('end', stopIdle);
-    // ★ v1.7.36：累计真实传输字节，够阈值才确认「真播」并落记录（只触发一次）。
-    //   探活/预取只拿几 KB 就断 ⇒ 永远到不了阈值 ⇒ 不落，根治「取链未播也算播」。
-    let committed = false;
-    let txBytes = 0;
-    src.on('data', chunk => {
-      bump();                                            // 有字节流动就把看门狗续上
-      if (committed || !onCommit) return;
-      txBytes += (chunk && chunk.length) || 0;
-      if (shouldCommitPlay(txBytes, PLAY_COMMIT_BYTES)) {
-        committed = true;
-        try { onCommit(); } catch { /* 记账失败绝不影响推流 */ }
-      }
-    });
-    bump();
-    src.pipe(res);
-  } catch (e) {
-    stopConnectTimer();
-    try { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); } catch {}
-    try { res.end('转发失败：' + String(e && e.message || e)); } catch { /* client gone */ }
-  }
-}
+/** 交给 pipeaudio 的阈值：沿用 files/play_commit_bytes 的覆盖值（真播判定门槛）。
+ *  用 getter 取值，避免和下面 `let PLAY_COMMIT_BYTES` 的声明顺序打架。 */
+const PIPE_OPTS = {
+  get minBytes() { return PLAY_COMMIT_BYTES; },
+  shouldCommit: (b, m) => shouldCommitPlay(b, m),
+};
 
 const MIN_FULL_BYTES = 480 * 1024;
 
@@ -4607,7 +4536,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(302, { Location: r.url, 'Cache-Control': 'no-cache' });
         return res.end();
       }
-      return pipeAudio(res, req, r.url);
+      return pipeAudio(res, req, r.url, null, PIPE_OPTS);
     }
 
 
@@ -4760,7 +4689,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(302, { Location: r.url, 'Cache-Control': 'no-cache' });
         return res.end();
       }
-      return pipeAudio(res, req, r.url, probe7 ? null : commit7);
+      return pipeAudio(res, req, r.url, probe7 ? null : commit7, PIPE_OPTS);
     }
 
     if (p === '/api/probe') {
